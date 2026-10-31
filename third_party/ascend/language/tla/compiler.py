@@ -46,32 +46,8 @@ def _stamp_tla_mode(module):
 
 
 def lower_ttir(module, context, compile_on_910_95=True, compile_mode="simd_simt_template", output_dir=None,
-               named_ops=True):
-    """Run the default non-distributed lowering prefix on a TLA TTIR module.
-
-    A standard inliner prefix (mirroring ``make_ttir``) first resolves JIT
-    helpers (``tt.func``/``tt.call``) via the Triton inliner interface; TLA
-    SIMD VFs are inline ``scope.scope`` ops at this stage, which the inliner
-    does not touch (outline-scope in bishengir extracts them later).
-
-    The TLA frontend already emits HIVM-HIR-level IR directly (``hivm.hir.*``
-    ops, ``annotation.mark``, ``memref`` ops, ``scf.for``, SIMD VF bodies
-    inside inline ``scope.scope`` regions with ``ave.hir.*`` ops), so the
-    TTIR-oriented stages of the generic runtime
-    chain are no-ops on TLA IR. Stage dumps confirm: ``triton_control_flow_opt``,
-    ``triton_to_structure``, ``discrete_mask_access_conversion``,
-    ``triton_to_annotation``, ``triton_to_unstructure``, ``triton_to_hivm``,
-    ``triton_to_hfusion``, ``triton_to_llvm``, ``bubble_up_operation`` and
-    ``merge_concat_load_buffer`` leave the module byte-identical (the first
-    ``triton_to_structure`` run only performs CSE/cleanup that the final
-    ``triton_to_linalg`` pass already reproduces via its own CSE+canonicalizer
-    sub-pipeline). They are therefore removed; only ``triton_to_linalg`` runs,
-    producing the ttadapter boundary (``func.func`` entry plus kernel ABI
-    attributes), so no ``tt.func``/TTIR reaches npuir (bishengir). The only
-    stage dumps written are ``00_inline.mlir`` and ``01_linalg.mlir``.
-    Distributed and dynamic CV pipelines, later adapter/backend stages and
-    launcher ABI are outside this offline entry point.
-    """
+               named_ops=True, inline=True):
+    """Adapt explicit TLA IR to a memref kernel entry."""
     from triton._C.libtriton import ir
     from triton._C.libtriton import passes
     from triton._C.libtriton import ascend as ascend_binding
@@ -82,14 +58,13 @@ def lower_ttir(module, context, compile_on_910_95=True, compile_mode="simd_simt_
     # Mark as TLA for the backend pipeline; unconditional (TLA-only entry).
     _stamp_tla_mode(module)
 
-    # Inline JIT helpers before conversion. The MLIR inliner handles both
-    # tt.call (Triton dialect interface) and func.call (registered interface).
-    pm = ir.pass_manager(context)
-    pm.enable_debug()
-    passes.common.add_inliner(pm)
-    pm.run(module, "module")
-    if not module.verify():
-        raise RuntimeError("inlining produced invalid IR")
+    if inline:
+        pm = ir.pass_manager(context)
+        pm.enable_debug()
+        add_affinity_ttir_pipeline(pm)
+        pm.run(module, "module")
+        if not module.verify():
+            raise RuntimeError("TLA TTIR pipeline produced invalid IR")
     if output_dir is not None:
         (output_dir / "00_inline.mlir").write_text(str(module))
 
@@ -100,19 +75,34 @@ def lower_ttir(module, context, compile_on_910_95=True, compile_mode="simd_simt_
     if calls:
         raise ValueError("unresolved tt.call after inlining; noinline JIT helpers cannot "
                          "cross the ttadapter boundary")
-    # Only triton_to_linalg runs on TLA IR (see docstring): the TTIR-oriented
-    # stages of the runtime chain are no-ops on TLA IR and are removed.
     pm = ir.pass_manager(context)
     pm.enable_debug()
-    ascend_binding.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, True, compile_on_910_95, compile_mode)
+    add_affinity_adapter_pipeline(pm)
     pm.run(module, "module")
     if not module.verify():
-        raise RuntimeError("triton_to_linalg produced invalid IR")
+        raise RuntimeError("tla_to_linalg produced invalid IR")
     _infer_tla_kernel_mode(module, context)
     if output_dir is not None:
         (output_dir / "01_linalg.mlir").write_text(str(module))
     check_ttadapter(module)
     return module
+
+
+def add_affinity_ttir_pipeline(pm):
+    """Resolve JIT helpers without applying generic Triton optimization."""
+    from triton._C.libtriton import passes
+
+    passes.common.add_inliner(pm)
+    passes.common.add_symbol_dce(pm)
+
+
+def add_affinity_adapter_pipeline(pm):
+    """Apply the TLA-only ABI adapter and its local cleanup."""
+    from triton._C.libtriton import passes
+    from triton._C.libtriton import ascend as ascend_binding
+
+    ascend_binding.passes.ttir.add_tla_to_linalg(pm)
+    passes.common.add_canonicalizer(pm)
 
 
 def _kernel_entries(module):

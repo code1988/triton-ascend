@@ -317,6 +317,16 @@ def _serialize_module(mod, opt):
 def make_ttir(mod, metadata, opt):
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
+    if opt.enable_tla_mode:
+        from triton.language.extra.tla.compiler import add_affinity_ttir_pipeline
+
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        add_affinity_ttir_pipeline(pm)
+        pm.run(mod, 'make_ttir')
+        if opt.debug:
+            get_dump_manager(metadata["hash"]).put(str(mod), "kernel.ttir.mlir", binary=False)
+        return mod
     # the same optimize pass for triton-ir as all other backends
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
@@ -342,6 +352,23 @@ def make_ttir(mod, metadata, opt):
 
 
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
+    if opt.enable_tla_mode:
+        from triton.language.extra.tla.compiler import lower_ttir
+
+        metadata["compile_mode"] = opt.compile_mode
+        metadata["has_auto_blockify_blacklist_op"] = False
+        enable_mixed_cv = metadata.get("enable_mixed_cv")
+        disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
+        set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
+        lower_ttir(mod, mod.context, inline=False)
+        _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
+                                          disable_auto_inject_block_sync=disable_auto_inject_block_sync,
+                                          set_workspace_multibuffer=set_workspace_multibuffer)
+        _export_program_grid_metadata(mod, metadata)
+        linalg_text = _serialize_module(mod, opt)
+        if opt.debug:
+            get_dump_manager(metadata["hash"]).put(linalg_text, "kernel.ttadapter.mlir", binary=False)
+        return linalg_text
     # use triton_adapter to lower Triton-MLIR to linalg
     # Get Triton-MLIR as string
     ttir_code = _serialize_module(mod, opt)
@@ -448,10 +475,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
             print(f"[DEBUG] cmd list: {shlex.join(cmd)}")
 
         pm.run(mod, 'ttir_to_linalg')
-        # Infer TLA kernel-mode attributes for backend compiler.
-        if getattr(opt, "enable_tla_mode", False):
-            from triton.language.extra.tla.compiler import _infer_tla_kernel_mode
-            _infer_tla_kernel_mode(mod, mod.context)
         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
