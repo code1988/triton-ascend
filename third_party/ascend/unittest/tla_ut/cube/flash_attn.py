@@ -2,12 +2,12 @@
 
 Semantics: O[BM, N] = softmax(Q[BM, D] @ K[BN, D]^T / sqrt(D)) @ V[BN, N]
 
-Inter-core (AIC <-> AIV) handoffs are synchronized by explicit FFTS flags
-(``tla.sync.block_set_flag`` / ``block_wait_flag``); intra-core ordering
-is left to the compiler.  Two flags, one per handoff:
+AIC <-> AIV handoffs within the same block are synchronized by explicit
+intra-block FFTS flags (``tla.sync.MODE.BLOCK``); intra-core ordering is left
+to the compiler. Two flags, one per handoff:
 
-  FLAG_S : AIC fixpipe wrote S to UB  -> AIV softmax reads S
-  FLAG_P : AIV stored P to GM         -> AIC loads P back into L1
+  FLAG_S : AIC fixpipe split S between the two AIVs -> AIV softmax reads S
+  FLAG_P : both AIVs stored their P rows to GM      -> AIC loads P into L1
 
 P must round-trip through GM because there is no UB -> L1 path yet; it is
 kept f32 (softmax output) and V is fp32 so both mmad inputs share dtype.
@@ -43,7 +43,8 @@ def flash_attn(Q_ptr, K_ptr, V_ptr, P_ptr, O_ptr, BM: tl.constexpr, BN: tl.const
     tl.static_assert(BN == 64, "v1: softmax row must fit one 64-lane f32 register")
 
     # AIC: S = Q @ K^T  (f16 cube inputs, f32 L0C).
-    s_ub = tla.alloc_buffer((BM, BN), tl.float32, space="ub")
+    tl.static_assert(BM % 32 == 0, "each AIV must receive a multiple of 16 rows")
+    s_ub = tla.alloc_buffer((BM // 2, BN), tl.float32, space="ub")
     q_blk = tla.view(Q_ptr, (BM, D), strides=(D, 1))
     k_blk = tla.view(K_ptr, (D, BN), strides=(BN, 1))  # contiguous K^T input
     with tla.scope.cube():
@@ -53,20 +54,25 @@ def flash_attn(Q_ptr, K_ptr, V_ptr, P_ptr, O_ptr, BM: tl.constexpr, BN: tl.const
         tla.copy(q_blk, q_l1)  # hivm.hir.nd2nz
         tla.copy(k_blk, k_l1)  # hivm.hir.nd2nz
         tla.cube.mmad(q_l1, k_l1, s_l0c, clear_accum=True)  # hivm.hir.mmadL1
-        tla.copy(s_l0c, s_ub)  # hivm.hir.fixpipe (NZ -> ND into UB)
-        # AIC: signal the softmax handoff only after fixpipe has written S.
-        tla.sync.block_set_flag(tla.sync.MODE.INTER, tla.sync.PIPE.F, FLAG_S)
+        tla.copy(s_l0c, s_ub,
+                 tla.FixpipeL0C2UBParams(dma_mode=tla.FixpipeDMAMode.NZ2ND,
+                                         dual_dst_mode=tla.FixpipeDualDstMode.ROW_SPLIT,
+                                         sub_block_idx=None))
+        # AIC: signal both AIVs after row-split fixpipe has written S.
+        tla.sync.block_set_flag(tla.sync.MODE.BLOCK, tla.sync.PIPE.F, FLAG_S)
 
-    # AIV: row-wise softmax of S in place (each row = one 64-lane f32 reg).
+    # Each AIV owns half the rows; both signal before AIC reloads the full P.
     p_blk = tla.view(P_ptr, (BM, BN), strides=(BN, 1))
     with tla.scope.vector():
-        p_ub = tla.alloc_buffer((BM, BN), tl.float32, space="ub")
-        # AIV: wait for S, then softmax each row and store P (f32) to GM.
-        tla.sync.block_wait_flag(tla.sync.MODE.INTER, tla.sync.PIPE.V, FLAG_S)
+        p_ub = tla.alloc_buffer((BM // 2, BN), tl.float32, space="ub")
+        p_part = tla.view(P_ptr, (BM // 2, BN), strides=(BN, 1),
+                          offsets=(tla.sub_block_id() * (BM // 2), 0))
+        # AIV: wait for its S rows, then softmax and store its P rows to GM.
+        tla.sync.block_wait_flag(tla.sync.MODE.BLOCK, tla.sync.PIPE.V, FLAG_S)
         with tla.scope.simd():
             one = tla.simd.vfull(1.0, tl.float32, 64)
             sc = tla.simd.vfull(SCALE, tl.float32, 64)
-            for r in tl.static_range(BM):
+            for r in tl.static_range(BM // 2):
                 v = tla.simd.vmul(tla.simd.vlds(s_ub[r, 0]), sc)
                 m = tla.simd.vreduce_max(v)  # row max, broadcast
                 v = tla.simd.vadd(v, tla.simd.vneg(m))
@@ -74,9 +80,9 @@ def flash_attn(Q_ptr, K_ptr, V_ptr, P_ptr, O_ptr, BM: tl.constexpr, BN: tl.const
                 l = tla.simd.vbroadcast(tla.simd.vreduce_sum(e), low=True)  # row sum
                 p = tla.simd.vmul(e, tla.simd.vdiv(one, l))
                 tla.simd.vsts(p_ub[r, 0], p)
-        tla.copy(p_ub, p_blk)  # hivm.hir.store (MTE3 UB->GM)
-        # AIV: signal the P round-trip only after the MTE3 store landed.
-        tla.sync.block_set_flag(tla.sync.MODE.INTER, tla.sync.PIPE.MTE3, FLAG_P)
+        tla.copy(p_ub, p_part)  # hivm.hir.store (MTE3 UB->GM)
+        # Each AIV signals after its MTE3 store; AIC waits for both signals.
+        tla.sync.block_set_flag(tla.sync.MODE.BLOCK, tla.sync.PIPE.MTE3, FLAG_P)
 
     # AIC: O = P @ V (f32 inputs -> f32 L0C), fixpipe straight to GM.
     v_blk = tla.view(V_ptr, (BN, N), strides=(N, 1))
@@ -86,7 +92,7 @@ def flash_attn(Q_ptr, K_ptr, V_ptr, P_ptr, O_ptr, BM: tl.constexpr, BN: tl.const
         v_l1 = tla.alloc_buffer((N // 8, BN // 16, 16, 8), tl.float32, space="l1")
         o_l0c = tla.alloc_buffer((N // 16, BM // 16, 16, 16), tl.float32, space="l0c")
         # AIC: wait for P, then load it back into L1 and accumulate O.
-        tla.sync.block_wait_flag(tla.sync.MODE.INTER, tla.sync.PIPE.MTE2, FLAG_P)
+        tla.sync.block_wait_flag(tla.sync.MODE.BLOCK, tla.sync.PIPE.MTE2, FLAG_P)
         tla.copy(p_blk, p_l1)  # hivm.hir.nd2nz
         tla.copy(v_blk, v_l1)  # hivm.hir.nd2nz
         tla.cube.mmad(p_l1, v_l1, o_l0c, clear_accum=True)  # hivm.hir.mmadL1
@@ -115,8 +121,8 @@ def test_ir(output_dir=None):
     module, ctx = compile_offline(flash_attn, SIGNATURE, constexprs(), output_dir=output_dir)
     text = str(module)
     assert "!tt.ptr" in text, "route A entry must keep pointer args at AST stage"
-    assert text.count("hivm.hir.pointer_cast") == 5, "tla.view(ptr) x5"
-    assert text.count("memref.reinterpret_cast") == 5, "tla.view(ptr) x5"
+    assert text.count("hivm.hir.pointer_cast") == 6, "tla.view(ptr) x6"
+    assert text.count("memref.reinterpret_cast") == 6, "tla.view(ptr) x6"
     module = lower_offline(module, ctx, output_dir=output_dir)
     text = str(module)
     check_lowered_ir(
@@ -127,8 +133,9 @@ def test_ir(output_dir=None):
     assert text.count("hivm.hir.fixpipe") == 2, "L0C->UB/GM x2 (S, O)"
     assert text.count("hivm.hir.sync_block_set") == 2, "AIC/AIV signals x2"
     assert text.count("hivm.hir.sync_block_wait") == 2, "AIV/AIC waits x2"
-    assert text.count("ave.hir.vexp") == SHAPE["BM"], "one exp per softmax row"
-    assert text.count("ave.hir.vload") == SHAPE["BM"], "one row load per softmax row"
+    assert "ROW_SPLIT" in text and "hivm.hir.get_sub_block_idx" in text
+    assert text.count("ave.hir.vexp") == SHAPE["BM"] // 2, "one exp per local softmax row"
+    assert text.count("ave.hir.vload") == SHAPE["BM"] // 2, "one row load per local softmax row"
 
     # Each handoff flag must follow its producer and precede its consumer.
     def nth(pat, k):
@@ -145,7 +152,7 @@ def test_ir(output_dir=None):
     assert 'mix_mode = "mix"' in text, "cube+vector kernel must be tagged mix"
     assert text.count("hivm.vector_function") == 1, "only the softmax SIMD scope is a VF"
     print("IR PASS: flash_attn HIVM structure ok"
-          " (4 nd2nz / 2 mmadL1 / 2 fixpipe / 2 sync set+wait / 1 store / 1 vexp per row)")
+          " (4 nd2nz / 2 mmadL1 / 2 fixpipe / 2 sync set+wait / 1 store / 32 vexp per AIV)")
 
 
 def _launch():
@@ -157,7 +164,7 @@ def _launch():
     O = torch.full((s["BM"], s["N"]), 7.0, dtype=torch.float32, device="npu")
     flash_attn[(1, )](Q, K.T.contiguous(), V, P, O, **constexprs())
     torch.npu.synchronize()
-    return Q, K, V, O
+    return Q, K, V, P, O
 
 
 def test_compile():
@@ -168,7 +175,9 @@ def test_compile():
 
 
 def test_run():
-    Q, K, V, O = _launch()
+    Q, K, V, P, O = _launch()
+    Pt = torch.softmax(Q.float() @ K.float().T * (1.0 / SHAPE["D"]**0.5), dim=-1)
+    torch.testing.assert_close(P, Pt, atol=1e-2, rtol=1e-2)
     Ot = _ref_torch(Q, K, V)
     oo, ot = O.cpu(), Ot.cpu()
     print("O[:4,:4]  :", oo[:4, :4].tolist())
