@@ -128,7 +128,12 @@ public:
         tritonOps.push_back(op);
     });
     for (Operation *op : tritonOps) {
-      if (auto ret = dyn_cast<triton::ReturnOp>(op)) {
+      if (auto assertion = dyn_cast<triton::AssertOp>(op);
+          assertion && assertion->hasAttr("tt.auto_overflow_assert")) {
+        // Match the generic TritonToLinalg handling of frontend-generated
+        // overflow checks, while leaving user assertions unsupported.
+        assertion.erase();
+      } else if (auto ret = dyn_cast<triton::ReturnOp>(op)) {
         builder.setInsertionPoint(ret);
         builder.create<func::ReturnOp>(ret.getLoc(), ret.getOperands());
         ret.erase();
