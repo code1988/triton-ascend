@@ -114,6 +114,114 @@ template <typename RangeT> static bool hasPointerFreeTypes(RangeT types) {
   return llvm::none_of(types, containsTritonPointer);
 }
 
+static bool isExplicitTLASimtScope(scope::ScopeOp scopeOp) {
+  auto mode = scopeOp->getAttrOfType<hivm::VFModeAttr>("hivm.vf_mode");
+  return mode && mode.getValue() == hivm::VFMode::SIMT &&
+         scopeOp->hasAttr("tla.core_mode");
+}
+
+static bool isWithinExplicitTLASimtScope(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto scopeOp = dyn_cast<scope::ScopeOp>(parent))
+      if (isExplicitTLASimtScope(scopeOp))
+        return true;
+  }
+  return false;
+}
+
+static void localizeTLASimtPointerBridges(ModuleOp moduleOp) {
+  SmallVector<UnrealizedConversionCastOp> bridges;
+  moduleOp.walk([&](UnrealizedConversionCastOp cast) {
+    if (cast.getInputs().size() == 1 && cast.getNumResults() == 1 &&
+        isa<MemRefType>(cast.getInputs().front().getType()) &&
+        isa<triton::PointerType>(cast.getResult(0).getType()))
+      bridges.push_back(cast);
+  });
+  for (auto bridge : bridges) {
+    scope::ScopeOp scopeOp;
+    bool sameScope = true;
+    for (Operation *user : bridge->getUsers()) {
+      auto parent = user->getParentOfType<scope::ScopeOp>();
+      if (!parent || !isExplicitTLASimtScope(parent) ||
+          (scopeOp && parent != scopeOp)) {
+        sameScope = false;
+        break;
+      }
+      scopeOp = parent;
+    }
+    if (sameScope && scopeOp)
+      bridge->moveBefore(&scopeOp.getRegion().front(),
+                         scopeOp.getRegion().front().begin());
+  }
+}
+
+static LogicalResult localizeTLASimtTensorCaptures(ModuleOp moduleOp) {
+  SmallVector<scope::ScopeOp> scopes;
+  moduleOp.walk([&](scope::ScopeOp scopeOp) {
+    if (isExplicitTLASimtScope(scopeOp))
+      scopes.push_back(scopeOp);
+  });
+  for (scope::ScopeOp scopeOp : scopes) {
+    Block &body = scopeOp.getRegion().front();
+    OpBuilder builder(&body, body.begin());
+    DenseMap<Value, Value> cloned;
+    std::function<FailureOr<Value>(Value)> localize =
+        [&](Value value) -> FailureOr<Value> {
+      Operation *def = value.getDefiningOp();
+      if (!def || scopeOp->isAncestor(def))
+        return value;
+      if (auto it = cloned.find(value); it != cloned.end())
+        return it->second;
+      if (auto fill = dyn_cast<linalg::FillOp>(def)) {
+        auto scalar = fill.getInputs().front().getDefiningOp<arith::ConstantOp>();
+        auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+        if (scalar && tensorType && tensorType.hasStaticShape()) {
+          Value constant = builder.create<arith::ConstantOp>(
+              def->getLoc(), tensorType,
+              DenseElementsAttr::get(tensorType, scalar.getValue()));
+          cloned[value] = constant;
+          return constant;
+        }
+      }
+      if (!isa<arith::ConstantOp>(def)) {
+        def->emitError("unsupported tensor value captured by TLA SIMT VF");
+        return failure();
+      }
+      IRMapping mapping;
+      for (Value operand : def->getOperands()) {
+        FailureOr<Value> mapped = localize(operand);
+        if (failed(mapped))
+          return failure();
+        mapping.map(operand, *mapped);
+      }
+      Operation *copy = builder.clone(*def, mapping);
+      for (auto [oldResult, newResult] :
+           llvm::zip_equal(def->getResults(), copy->getResults()))
+        cloned[oldResult] = newResult;
+      return cloned.lookup(value);
+    };
+    WalkResult result = scopeOp.walk([&](Operation *op) -> WalkResult {
+      for (OpOperand &operand : op->getOpOperands()) {
+        Value value = operand.get();
+        if (!isa<RankedTensorType>(value.getType()))
+          continue;
+        Operation *def = value.getDefiningOp();
+        if (!def || scopeOp->isAncestor(def))
+          continue;
+        FailureOr<Value> mapped = localize(value);
+        if (failed(mapped))
+          return WalkResult::interrupt();
+        operand.set(*mapped);
+      }
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      return failure();
+  }
+  return success();
+}
+
 template <typename RangeT> static bool hasPointerFreeValues(RangeT values) {
   return llvm::none_of(values, [](auto value) {
     return containsTritonPointer(value.getType());
@@ -615,6 +723,19 @@ public:
   MemoryTypeConverter() {
     addConversion([](Type type) { return type; });
 
+    addSourceMaterialization([](OpBuilder &builder,
+                                triton::PointerType resultType,
+                                ValueRange inputs, Location loc) -> Value {
+      if (inputs.size() != 1)
+        return nullptr;
+      auto memrefType = dyn_cast<MemRefType>(inputs.front().getType());
+      if (!memrefType || memrefType != convertPointerType(resultType))
+        return nullptr;
+      return builder
+          .create<UnrealizedConversionCastOp>(loc, resultType, inputs.front())
+          .getResult(0);
+    });
+
     addConversion([](triton::PointerType pointerType) {
       return convertPointerType(pointerType);
     });
@@ -1074,6 +1195,9 @@ static void addMemoryConversionLegalities(ConversionTarget &target,
                                           MemoryTypeConverter &typeConverter) {
   target.addLegalOp<ModuleOp>();
 
+  target.addLegalOp<scope::ScopeOp>();
+  target.markOpRecursivelyLegal<scope::ScopeOp>(isExplicitTLASimtScope);
+
   // Partial conversion is intentionally opt-in. Supporting operations such as
   // tensor.empty may temporarily carry a pointer element type but are owned by
   // the converter of their consuming structured custom op, not by a standalone
@@ -1164,6 +1288,10 @@ static void removePointerConversionHandoffAttrs(ModuleOp moduleOp) {
 static LogicalResult verifyNoTritonPointers(ModuleOp moduleOp) {
   bool valid = true;
   moduleOp.walk([&](Operation *op) {
+    if (isWithinExplicitTLASimtScope(op) ||
+        (isa<UnrealizedConversionCastOp>(op) &&
+         llvm::all_of(op->getUsers(), isWithinExplicitTLASimtScope)))
+      return;
     if (!hasPointerFreeTypes(op->getOperandTypes()) ||
         !hasPointerFreeTypes(op->getResultTypes())) {
       op->emitError("pointer-bearing operation survived memory conversion");
@@ -1851,6 +1979,7 @@ void TritonToLinalgPass::runOnOperation() {
   }
 
   auto moduleOp = getOperation();
+  localizeTLASimtPointerBridges(moduleOp);
 
   // Validate the CFO handoff before any rewrite can erase malformed metadata.
   if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
@@ -2052,6 +2181,8 @@ TritonToLinalgPass::convertRemainingComputations(ModuleOp moduleOp) {
   ConversionTarget target(getContext());
   TritonTypeConverter tritonTypeConverter{};
   this->addDynamicLegal(target, tritonTypeConverter);
+  target.addLegalOp<scope::ScopeOp>();
+  target.markOpRecursivelyLegal<scope::ScopeOp>(isExplicitTLASimtScope);
 
   auto loopOpLegalFn = [](LoopLikeOpInterface loopOp) {
     return !loopOp->hasAttr("UnhandledLoopOp");
@@ -2143,6 +2274,18 @@ LogicalResult TritonToLinalgPass::finalizeLoweredModule(ModuleOp moduleOp,
   optimizeInterleavedStores(moduleOp);
   addRuntimeWorkspaceArguments(moduleOp);
   repairUnknownLocations(moduleOp);
+  if (failed(localizeTLASimtTensorCaptures(moduleOp)))
+    return failure();
+  bool hasTLASimtScope = false;
+  moduleOp.walk([&](scope::ScopeOp scopeOp) {
+    hasTLASimtScope |= isExplicitTLASimtScope(scopeOp);
+  });
+  if (hasTLASimtScope) {
+    PassManager cleanup(moduleOp.getContext(), moduleOp.getOperationName());
+    cleanup.addPass(createCanonicalizerPass());
+    if (failed(runPipeline(cleanup, moduleOp)))
+      return failure();
+  }
   return success();
 }
 

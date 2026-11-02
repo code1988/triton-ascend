@@ -26,10 +26,10 @@ __all__ = ["handle_scope_with"]
 
 def handle_scope_with(generator, node):
     """
-    Handle 'with tla.scope.simd()/tla.scope.cube():' by emitting an inline
+    Handle 'with tla.scope.simd()/tla.scope.simt()/tla.scope.cube():' by emitting an inline
     ``scope.scope`` carrying the attributes defined by the scope class
     (``mlir_attrs``); the bishengir HFusion pipeline's outline-scope extracts
-    the marked SIMD scope into the ``func.func`` + ``func.call`` that the HIVM
+    the marked VF scope into the ``func.func`` + ``func.call`` that the HIVM
     stage expects.
 
     The register ops stay inline (sharing the enclosing function's scope, so

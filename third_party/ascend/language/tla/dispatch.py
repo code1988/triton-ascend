@@ -8,14 +8,16 @@ in ``CodeGenerator.__init__`` by the patch) before any kernel compiles.
 """
 
 from .code_generator import handle_scope_with
-from .scope import vector, simd, cube
+from .scope import vector, simd, simt, cube
 
 __all__ = ["TLA_WITH_DISPATCH", "register_with_dispatch"]
 
-# 'with' handlers keyed by scope class.
+# 'with' handlers keyed by the context-manager class
+# (tla.scope.vector / tla.scope.simd / tla.scope.simt / tla.scope.cube).
 TLA_WITH_DISPATCH = {
     vector: handle_scope_with,
     simd: handle_scope_with,
+    simt: handle_scope_with,
     cube: handle_scope_with,
 }
 

@@ -17,21 +17,22 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Core-mode scopes for TLA (``with tla.scope.simd():``).
+"""Core and vector-function scopes for TLA.
 
 A scope marks a block of ops (``simd.*`` on the vector core) that the compiler
 emits as an inline ``scope.scope`` carrying the core-mode markers; the
 bishengir ``outline-scope`` pass extracts marked SIMD scopes into the
 ``func.func`` + ``func.call`` that the HIVM stage consumes.
 
-``tla.scope.vector()``, ``tla.scope.simd()`` and ``tla.scope.cube()`` are the
+``tla.scope.vector()``, ``tla.scope.simd()``, ``tla.scope.simt()`` and
+``tla.scope.cube()`` are the
 entry points; each is a context-manager class (the core mode is fixed on the
 class), so the compiler dispatch table keys off the class object itself. Each
 class defines ``mlir_attrs``, the attribute set stamped on the emitted
 ``scope.scope``.
 """
 
-__all__ = ["scope", "vector", "simd", "cube"]
+__all__ = ["scope", "vector", "simd", "simt", "cube"]
 
 
 class scope:
@@ -91,6 +92,28 @@ class simd(scope):
         return attrs
 
 
+class simt(scope):
+    """``with tla.scope.simt():`` -- SIMT VF on the vector core.
+
+    The scope is outlined for the SIMT lowering path. Its body uses Triton
+    Tensor operations, including ``tl.load`` and ``tl.store`` for GM access.
+    """
+
+    core_mode = "vector"
+
+    @classmethod
+    def mlir_attrs(cls, builder):
+        attrs = super().mlir_attrs(builder)
+        attrs.update({
+            "no_inline": builder.get_unit_attr(),
+            "outline": builder.get_unit_attr(),
+            "vector_mode": builder.get_string_attr("simt"),
+            "hivm.func_core_type": builder.parse_attr("#hivm.func_core_type<AIV>"),
+            "hivm.vf_mode": builder.parse_attr("#hivm.vf_mode<SIMT>"),
+        })
+        return attrs
+
+
 class cube(scope):
     """``with tla.scope.cube():`` -- cube-core region (reserved; cube ops not yet exposed).
 
@@ -108,4 +131,5 @@ class cube(scope):
 # ``tla.scope`` resolves as the namespace holding the fixed-core-mode classes.
 scope.vector = vector
 scope.simd = simd
+scope.simt = simt
 scope.cube = cube

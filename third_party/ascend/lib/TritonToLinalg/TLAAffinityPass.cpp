@@ -1,5 +1,7 @@
 #include "ascend/include/TritonToLinalg/TLAAffinityPass.h"
 
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -7,11 +9,29 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
 
 namespace {
+
+static bool isTLASimtScope(scope::ScopeOp scope) {
+  auto mode = scope->getAttrOfType<hivm::VFModeAttr>("hivm.vf_mode");
+  auto vectorMode = scope->getAttrOfType<StringAttr>("vector_mode");
+  return mode && mode.getValue() == hivm::VFMode::SIMT && vectorMode &&
+         vectorMode.getValue() == "simt";
+}
+
+static bool isInTLASimtScope(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto scope = dyn_cast<scope::ScopeOp>(parent))
+      if (isTLASimtScope(scope))
+        return true;
+  }
+  return false;
+}
 
 class TLAAffinityToLinalgPass final
     : public PassWrapper<TLAAffinityToLinalgPass, OperationPass<ModuleOp>> {
@@ -102,6 +122,7 @@ public:
       SmallVector<OpOperand *> uses;
       for (OpOperand &use : arg.getUses())
         uses.push_back(&use);
+      DenseMap<Operation *, Value> scopeBridges;
       for (OpOperand *use : uses) {
         Operation *owner = use->getOwner();
         if (auto ptrToInt = dyn_cast<triton::PtrToIntOp>(owner)) {
@@ -115,8 +136,21 @@ public:
           ptrToInt.erase();
           continue;
         }
-        fail(owner, "unsupported TLA pointer use outside affinity operations");
-        return;
+        auto scope = owner->getParentOfType<scope::ScopeOp>();
+        if (!scope || !isTLASimtScope(scope)) {
+          fail(owner, "unsupported TLA pointer use outside SIMT scope");
+          return;
+        }
+        Value bridge = scopeBridges.lookup(scope.getOperation());
+        if (!bridge) {
+          builder.setInsertionPointToStart(&scope.getRegion().front());
+          bridge = builder
+                       .create<UnrealizedConversionCastOp>(owner->getLoc(),
+                                                           pointer, arg)
+                       .getResult(0);
+          scopeBridges[scope.getOperation()] = bridge;
+        }
+        use->set(bridge);
       }
     }
 
@@ -124,7 +158,7 @@ public:
     // program information and the entry terminator need adapter rewrites.
     SmallVector<Operation *> tritonOps;
     target.walk([&](Operation *op) {
-      if (op->getName().getDialectNamespace() == "tt")
+      if (op->getName().getDialectNamespace() == "tt" && !isInTLASimtScope(op))
         tritonOps.push_back(op);
     });
     for (Operation *op : tritonOps) {
@@ -155,7 +189,7 @@ public:
         count.replaceAllUsesWith(body.getArgument(originalTypes.size() + axis));
         count.erase();
       } else {
-        fail(op, "unsupported TTIR in TLA affinity module");
+        fail(op, "unsupported TTIR outside TLA SIMT scope");
         return;
       }
     }

@@ -26,7 +26,7 @@ from the TLA repo's SIMD VF additions.  It does **not** reuse the existing
 
 Exports: ``alloc_buffer``/``alloc`` (on-chip buffer + versions),
 ``copy`` (GM<->buffer), ``view`` (GM view), ``scope`` (core-mode scopes:
-``tla.scope.simd()`` / ``tla.scope.cube()``),
+``tla.scope.simd()`` / ``tla.scope.simt()`` / ``tla.scope.cube()``),
 ``simd`` (vector-register ops), ``annotate_buffer_versions``.
 """
 
